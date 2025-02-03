@@ -1,0 +1,1297 @@
+#include "imgui.h"
+#include "imgui_impl_sdl2.h"
+#include "imgui_impl_opengl3.h"
+#include "../../misc/cpp/imgui_stdlib.h"
+
+#include <stdio.h>
+#include <SDL.h>
+#include <vector>
+#include <string>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <memory>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <sstream>
+#include <fstream>
+#include <iomanip>
+#include <algorithm>
+#include <cctype>
+#include <unordered_map>
+#include <filesystem>
+
+using json = nlohmann::json;
+
+#if defined(IMGUI_IMPL_OPENGL_ES2)
+#include <SDL_opengles2.h>
+#else
+#include <SDL_opengl.h>
+#endif
+
+#ifdef __EMSCRIPTEN__
+#include "../libs/emscripten/emscripten_mainloop_stub.h"
+#endif
+
+#include <imgui_internal.h>
+#include <iostream>
+
+// rest client state using std::string to avoid size limits
+struct RestClientState
+{
+    std::string url = "";
+    std::string request_body = "";
+    std::string response_text = "";
+    std::string response_headers = "";
+
+    long response_code = 0;
+
+    const char *methods[7] = {"GET", "POST", "PUT", "DELETE",
+                              "PATCH", "HEAD", "OPTIONS"};
+    int selected_method = 0;
+
+    bool show_headers = true;
+    bool show_styleed = false;
+    bool show_body = false;
+    bool show_query = false;
+    bool show_fps = false;
+
+    std::atomic<bool> request_in_progress{false};
+
+    std::chrono::steady_clock::time_point request_start_time;
+    std::atomic<double> elapsed_ms{0.0};
+
+    std::chrono::steady_clock::time_point last_refresh_time;
+    static constexpr auto REFRESH_INTERVAL = std::chrono::seconds(1);
+
+    std::mutex response_mutex;
+
+    struct KeyValue
+    {
+        std::string key;
+        std::string value;
+    };
+
+    std::vector<KeyValue> headers;
+    std::vector<KeyValue> queries;
+
+    bool pretty_print_json = false;
+    std::string formatted_response;
+};
+
+std::string format_size(size_t bytes)
+{
+    if (bytes < 1024)
+        return std::to_string(bytes) + " B";
+    if (bytes < 1024 * 1024)
+    {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(1) << (bytes / 1024.0) << " KB";
+        return ss.str();
+    }
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(1) << (bytes / (1024.0 * 1024.0)) << " MB";
+    return ss.str();
+}
+
+bool try_format_json(const std::string &input, std::string &output)
+{
+    try
+    {
+        json j = json::parse(input);
+        output = j.dump(2); // 2 spaces for indentation
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+// callback to accumulate response body
+size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    size_t total = size * nmemb;
+    std::string *str = static_cast<std::string *>(userp);
+    str->append(reinterpret_cast<char *>(contents), total);
+    return total;
+}
+
+// callback to accumulate header lines
+size_t HeaderCallback(char *buffer, size_t size, size_t nitems, void *userdata)
+{
+    size_t total = size * nitems;
+    std::string *str = static_cast<std::string *>(userdata);
+    str->append(buffer, total);
+    return total;
+}
+
+// helper: build full url with query params, checking for an existing '?'
+std::string build_full_url(const RestClientState &state, CURL *curl)
+{
+    std::string full_url = state.url;
+    if (!state.queries.empty())
+    {
+        full_url += (full_url.find('?') == std::string::npos ? "?" : "&");
+        bool first = true;
+        for (const auto &q : state.queries)
+        {
+            if (!first)
+                full_url += "&";
+            first = false;
+            char *esc_key = curl_easy_escape(curl, q.key.c_str(), 0);
+            char *esc_val = curl_easy_escape(curl, q.value.c_str(), 0);
+            full_url += std::string(esc_key) + "=" + std::string(esc_val);
+            curl_free(esc_key);
+            curl_free(esc_val);
+        }
+    }
+
+    // cout the full url
+    std::cout << "Full URL: " << full_url << std::endl;
+
+    return full_url;
+}
+
+// convert current state to a plaintext curl command
+std::string request_to_curl(const RestClientState &state)
+{
+    std::ostringstream oss;
+    oss << "curl";
+    if (state.selected_method != 0)
+        oss << " -X " << state.methods[state.selected_method];
+    for (const auto &header : state.headers)
+    {
+        if (!header.key.empty())
+            oss << " -H \"" << header.key << ": " << header.value << "\"";
+    }
+    if (!state.request_body.empty())
+        oss << " -d '" << state.request_body << "'";
+    oss << " \"" << state.url;
+    if (!state.queries.empty())
+    {
+        oss << (state.url.find('?') == std::string::npos ? "?" : "&");
+        bool first = true;
+        for (const auto &query : state.queries)
+        {
+            if (!first)
+                oss << "&";
+            first = false;
+            oss << query.key << "=" << query.value;
+        }
+    }
+    oss << "\"";
+    return oss.str();
+}
+
+// basic parser to convert a curl command into a RestClientState.
+// expects a command generated by request_to_curl
+void parse_curl_request(RestClientState &state, const std::string &cmd)
+{
+    state.url.clear();
+    state.request_body.clear();
+    state.headers.clear();
+    state.queries.clear();
+    state.selected_method = 0;
+
+    enum class ParseState
+    {
+        Normal,
+        ReadingData
+    };
+    ParseState current_state = ParseState::Normal;
+
+    std::istringstream iss(cmd);
+    std::string token;
+    std::string data_buffer;
+    char quote_char = 0;
+
+    while (iss >> token)
+    {
+        if (current_state == ParseState::ReadingData)
+        {
+            // Check if this token ends the data section
+            if (token.back() == quote_char)
+            {
+                data_buffer += " " + token.substr(0, token.length() - 1);
+                state.request_body = data_buffer;
+                current_state = ParseState::Normal;
+                continue;
+            }
+            data_buffer += " " + token;
+            continue;
+        }
+
+        if (token == "curl")
+            continue;
+        else if (token == "-X")
+        {
+            std::string method;
+            if (iss >> method)
+            {
+                for (int i = 0; i < 7; i++)
+                {
+                    if (method == state.methods[i])
+                    {
+                        state.selected_method = i;
+                        break;
+                    }
+                }
+            }
+        }
+        else if (token == "-H")
+        {
+            std::string header;
+            if (iss >> std::quoted(header))
+            {
+                auto pos = header.find(':');
+                if (pos != std::string::npos)
+                {
+                    RestClientState::KeyValue kv;
+                    kv.key = header.substr(0, pos);
+                    kv.value = header.substr(pos + 1);
+
+                    auto trim = [](std::string &s)
+                    {
+                        s.erase(s.begin(),
+                                std::find_if(s.begin(), s.end(),
+                                             [](unsigned char ch)
+                                             { return !std::isspace(ch); }));
+                        s.erase(std::find_if(s.rbegin(), s.rend(),
+                                             [](unsigned char ch)
+                                             { return !std::isspace(ch); })
+                                    .base(),
+                                s.end());
+                    };
+
+                    trim(kv.key);
+                    trim(kv.value);
+                    state.headers.push_back(kv);
+                }
+            }
+        }
+        else if (token == "-d")
+        {
+            char next = iss.get(); // consume space
+            if (next == ' ' || next == '\t')
+            {
+                next = iss.peek();
+                if (next == '\'' || next == '"')
+                {
+                    quote_char = next;
+                    iss.get(); // consume quote
+                    std::string first_token;
+                    iss >> first_token;
+                    if (first_token.back() == quote_char)
+                    {
+                        // Single token data
+                        state.request_body = first_token.substr(0, first_token.length() - 1);
+                    }
+                    else
+                    {
+                        // Multi-token data
+                        data_buffer = first_token;
+                        current_state = ParseState::ReadingData;
+                    }
+                }
+                else
+                {
+                    // Unquoted data - read to end of line
+                    std::string data;
+                    std::getline(iss, data);
+                    state.request_body = data;
+                }
+            }
+        }
+        else if (token.front() == '\'' || token.front() == '"')
+        {
+            // URL token
+            std::string url = token;
+            if (url.front() == '\'' || url.front() == '"')
+                url.erase(0, 1);
+            if (url.back() == '\'' || url.back() == '"')
+                url.pop_back();
+
+            auto pos = url.find('?');
+            if (pos != std::string::npos)
+            {
+                state.url = url.substr(0, pos);
+                std::string query = url.substr(pos + 1);
+                std::istringstream qss(query);
+                std::string pair;
+                while (std::getline(qss, pair, '&'))
+                {
+                    auto eq = pair.find('=');
+                    if (eq != std::string::npos)
+                    {
+                        RestClientState::KeyValue q;
+                        q.key = pair.substr(0, eq);
+                        q.value = pair.substr(eq + 1);
+                        state.queries.push_back(q);
+                    }
+                }
+            }
+            else
+            {
+                state.url = url;
+            }
+        }
+    }
+
+    // If we're still in data reading state, add the accumulated data
+    if (current_state == ParseState::ReadingData)
+    {
+        state.request_body = data_buffer;
+    }
+
+    // Attempt to JSON format the request body if possible
+    if (!state.request_body.empty())
+    {
+        std::string formatted;
+        if (try_format_json(state.request_body, formatted))
+        {
+            state.request_body = formatted;
+        }
+    }
+}
+
+// the actual request sending function (runs on a background thread)
+void send_request(RestClientState &state)
+{
+
+    CURL *curl = curl_easy_init();
+    if (!curl)
+    {
+        std::lock_guard<std::mutex> lock(state.response_mutex);
+        state.response_text = "curl error: failed to init curl";
+        state.request_in_progress = false;
+        return;
+    }
+    std::string response_str;
+    std::string header_str;
+    std::string full_url = build_full_url(state, curl);
+
+    curl_easy_setopt(curl, CURLOPT_URL, full_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_str);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &header_str);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+    if (state.selected_method != 0)
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, state.methods[state.selected_method]);
+
+    struct curl_slist *header_list = nullptr;
+    for (const auto &h : state.headers)
+    {
+        if (!h.key.empty())
+        {
+            std::string header_line = h.key + ": " + h.value;
+            header_list = curl_slist_append(header_list, header_line.c_str());
+        }
+    }
+    if (header_list)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
+
+    if (!state.request_body.empty())
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, state.request_body.c_str());
+
+    char error_buffer[CURL_ERROR_SIZE];
+    error_buffer[0] = '\0';
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
+
+    // start the request clock
+    state.request_start_time = std::chrono::steady_clock::now();
+
+    CURLcode res = curl_easy_perform(curl);
+
+    // stop the request clock
+    auto end_time = std::chrono::steady_clock::now();
+    state.elapsed_ms = std::chrono::duration<double, std::milli>(
+                           end_time - state.request_start_time)
+                           .count();
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+    {
+        std::lock_guard<std::mutex> lock(state.response_mutex);
+        state.response_code = http_code;
+        if (res != CURLE_OK)
+        {
+            state.response_text = std::string("curl error: ") +
+                                  curl_easy_strerror(res);
+            if (error_buffer[0] != '\0')
+            {
+                state.response_text += " - ";
+                state.response_text += error_buffer;
+            }
+        }
+        else
+        {
+            state.response_text = response_str;
+            if (state.pretty_print_json)
+            {
+                try_format_json(state.response_text, state.formatted_response);
+            }
+        }
+        state.response_headers = header_str;
+    }
+    if (header_list)
+        curl_slist_free_all(header_list);
+    curl_easy_cleanup(curl);
+    state.request_in_progress = false;
+}
+
+struct SavedRequest
+{
+    std::string name;
+    std::string curl_command;
+};
+
+// global storage for recent/saved requests (curl command strings)
+std::vector<SavedRequest> recent_requests;
+
+std::vector<SavedRequest> load_saved_requests()
+{
+    std::vector<SavedRequest> requests;
+    for (const auto &entry : std::filesystem::directory_iterator("."))
+    {
+        if (entry.path().extension() == ".curl")
+        {
+            std::ifstream file(entry.path());
+            if (file)
+            {
+                std::stringstream buffer;
+                buffer << file.rdbuf();
+                requests.push_back({entry.path().filename().string(), buffer.str()});
+            }
+        }
+    }
+    // sort by filename
+    std::sort(requests.begin(), requests.end(),
+              [](const SavedRequest &a, const SavedRequest &b)
+              {
+                  return a.name < b.name;
+              });
+    return requests;
+}
+
+int main(int, char **)
+{
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0)
+    {
+        printf("error: %s\n", SDL_GetError());
+        return -1;
+    }
+
+#if defined(IMGUI_IMPL_OPENGL_ES2)
+    const char *glsl_version = "#version 100";
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#elif defined(IMGUI_IMPL_OPENGL_ES3)
+    const char *glsl_version = "#version 300 es";
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#elif defined(__APPLE__)
+    const char *glsl_version = "#version 150";
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS,
+                        SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+#else
+    const char *glsl_version = "#version 130";
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
+
+#ifdef SDL_HINT_IME_SHOW_UI
+    SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
+#endif
+
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    SDL_WindowFlags window_flags =
+        (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window *window = SDL_CreateWindow("snooze rest client",
+                                          SDL_WINDOWPOS_CENTERED,
+                                          SDL_WINDOWPOS_CENTERED, 1280, 720,
+                                          window_flags);
+    if (window == nullptr)
+    {
+        printf("error: sdl_createwindow(): %s\n", SDL_GetError());
+        return -1;
+    }
+
+    SDL_GLContext gl_context = SDL_GL_CreateContext(window);
+    if (gl_context == nullptr)
+    {
+        printf("error: sdl_gl_createcontext(): %s\n", SDL_GetError());
+        return -1;
+    }
+    SDL_GL_MakeCurrent(window, gl_context);
+    SDL_GL_SetSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+
+    // ***** Dracula Theme from https://github.com/ocornut/imgui/issues/707#issuecomment-1372640066 *****
+    auto &colors = ImGui::GetStyle().Colors;
+    colors[ImGuiCol_WindowBg] = ImVec4{0.1f, 0.1f, 0.13f, 1.0f};
+    colors[ImGuiCol_MenuBarBg] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+
+    // Border
+    colors[ImGuiCol_Border] = ImVec4{0.44f, 0.37f, 0.61f, 0.29f};
+    colors[ImGuiCol_BorderShadow] = ImVec4{0.0f, 0.0f, 0.0f, 0.24f};
+
+    // Text
+    colors[ImGuiCol_Text] = ImVec4{1.0f, 1.0f, 1.0f, 1.0f};
+    colors[ImGuiCol_TextDisabled] = ImVec4{0.5f, 0.5f, 0.5f, 1.0f};
+
+    // Headers
+    colors[ImGuiCol_Header] = ImVec4{0.13f, 0.13f, 0.17, 1.0f};
+    colors[ImGuiCol_HeaderHovered] = ImVec4{0.19f, 0.2f, 0.25f, 1.0f};
+    colors[ImGuiCol_HeaderActive] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+
+    // Buttons
+    colors[ImGuiCol_Button] = ImVec4{0.13f, 0.13f, 0.17, 1.0f};
+    colors[ImGuiCol_ButtonHovered] = ImVec4{0.19f, 0.2f, 0.25f, 1.0f};
+    colors[ImGuiCol_ButtonActive] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+    colors[ImGuiCol_CheckMark] = ImVec4{0.74f, 0.58f, 0.98f, 1.0f};
+
+    // Popups
+    colors[ImGuiCol_PopupBg] = ImVec4{0.1f, 0.1f, 0.13f, 0.92f};
+
+    // Slider
+    colors[ImGuiCol_SliderGrab] = ImVec4{0.44f, 0.37f, 0.61f, 0.54f};
+    colors[ImGuiCol_SliderGrabActive] = ImVec4{0.74f, 0.58f, 0.98f, 0.54f};
+
+    // Frame BG
+    colors[ImGuiCol_FrameBg] = ImVec4{0.13f, 0.13, 0.17, 1.0f};
+    colors[ImGuiCol_FrameBgHovered] = ImVec4{0.19f, 0.2f, 0.25f, 1.0f};
+    colors[ImGuiCol_FrameBgActive] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+
+    // Tabs
+    colors[ImGuiCol_Tab] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+    colors[ImGuiCol_TabHovered] = ImVec4{0.24, 0.24f, 0.32f, 1.0f};
+    colors[ImGuiCol_TabActive] = ImVec4{0.2f, 0.22f, 0.27f, 1.0f};
+    colors[ImGuiCol_TabUnfocused] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+    colors[ImGuiCol_TabUnfocusedActive] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+
+    // Title
+    colors[ImGuiCol_TitleBg] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+    colors[ImGuiCol_TitleBgActive] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+    colors[ImGuiCol_TitleBgCollapsed] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+
+    // Scrollbar
+    colors[ImGuiCol_ScrollbarBg] = ImVec4{0.1f, 0.1f, 0.13f, 1.0f};
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4{0.16f, 0.16f, 0.21f, 1.0f};
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4{0.19f, 0.2f, 0.25f, 1.0f};
+    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4{0.24f, 0.24f, 0.32f, 1.0f};
+
+    // Seperator
+    colors[ImGuiCol_Separator] = ImVec4{0.44f, 0.37f, 0.61f, 1.0f};
+    colors[ImGuiCol_SeparatorHovered] = ImVec4{0.74f, 0.58f, 0.98f, 1.0f};
+    colors[ImGuiCol_SeparatorActive] = ImVec4{0.84f, 0.58f, 1.0f, 1.0f};
+
+    // Resize Grip
+    colors[ImGuiCol_ResizeGrip] = ImVec4{0.44f, 0.37f, 0.61f, 0.29f};
+    colors[ImGuiCol_ResizeGripHovered] = ImVec4{0.74f, 0.58f, 0.98f, 0.29f};
+    colors[ImGuiCol_ResizeGripActive] = ImVec4{0.84f, 0.58f, 1.0f, 0.29f};
+
+    // Docking
+    colors[ImGuiCol_DockingPreview] = ImVec4{0.44f, 0.37f, 0.61f, 1.0f};
+
+    auto &style = ImGui::GetStyle();
+    style.TabRounding = 4;
+    style.ScrollbarRounding = 9;
+    style.WindowRounding = 7;
+    style.GrabRounding = 3;
+    style.FrameRounding = 3;
+    style.PopupRounding = 4;
+    style.ChildRounding = 4;
+
+    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+
+    curl_global_init(CURL_GLOBAL_ALL);
+
+    RestClientState state;
+    std::unique_ptr<std::thread> request_thread;
+
+    bool show_save_popup = false;
+    bool show_open_popup = false;
+    std::string save_file_path = "request.curl";
+    std::string open_file_path = "request.curl";
+    ImVec4 clear_color = ImVec4(0.08f, 0.08f, 0.08f, 1.00f);
+    bool done = false;
+
+#ifdef __EMSCRIPTEN__
+    io.IniFilename = nullptr;
+    EMSCRIPTEN_MAINLOOP_BEGIN
+#else
+    while (!done)
+#endif
+    {
+        SDL_Event event;
+        while (SDL_PollEvent(&event))
+        {
+            ImGui_ImplSDL2_ProcessEvent(&event);
+            if (event.type == SDL_QUIT)
+                done = true;
+            if (event.type == SDL_WINDOWEVENT &&
+                event.window.event == SDL_WINDOWEVENT_CLOSE &&
+                event.window.windowID == SDL_GetWindowID(window))
+                done = true;
+        }
+        if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)
+        {
+            SDL_Delay(100);
+            continue;
+        }
+
+        if (!ImGui::IsAnyItemActive() && !ImGui::IsAnyItemHovered() &&
+            !state.request_in_progress && !ImGui::IsMouseDragging(0))
+        {
+            SDL_Delay(65);
+        }
+
+        if (request_thread && !state.request_in_progress)
+        {
+            if (request_thread->joinable())
+                request_thread->join();
+            request_thread.reset();
+        }
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplSDL2_NewFrame();
+        ImGui::NewFrame();
+
+        auto now = std::chrono::steady_clock::now();
+        if (now - state.last_refresh_time >= RestClientState::REFRESH_INTERVAL)
+        {
+            recent_requests = load_saved_requests();
+            state.last_refresh_time = now;
+        }
+
+        auto get_method_color = [&](int method) -> ImVec4
+        {
+            switch (method)
+            {
+            case 0:
+                return ImVec4(0.27f, 0.67f, 0.38f, 1.0f); // get: soft green
+            case 1:
+                return ImVec4(0.24f, 0.48f, 0.85f, 1.0f); // post: royal blue
+            case 2:
+                return ImVec4(0.93f, 0.67f, 0.13f, 1.0f); // put: amber
+            case 3:
+                return ImVec4(0.91f, 0.30f, 0.24f, 1.0f); // delete: soft red
+            case 4:
+                return ImVec4(0.61f, 0.35f, 0.71f, 1.0f); // patch: purple
+            case 5:
+                return ImVec4(0.76f, 0.70f, 0.25f, 1.0f); // head: gold
+            default:
+                return ImVec4(0.50f, 0.50f, 0.50f, 1.0f); // default: gray
+            }
+        };
+
+        // dockspace container
+        {
+            ImGuiViewport *viewport = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(viewport->Pos);
+            ImGui::SetNextWindowSize(viewport->Size);
+            ImGui::SetNextWindowViewport(viewport->ID);
+            ImGuiWindowFlags host_flags = ImGuiWindowFlags_MenuBar |
+                                          ImGuiWindowFlags_NoDocking |
+                                          ImGuiWindowFlags_NoCollapse |
+                                          ImGuiWindowFlags_NoResize |
+                                          ImGuiWindowFlags_NoMove |
+                                          ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                          ImGuiWindowFlags_NoNavFocus |
+                                          ImGuiWindowFlags_NoBackground;
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+            ImGui::Begin("snooze", nullptr, host_flags | ImGuiWindowFlags_NoTitleBar);
+            ImGui::PopStyleVar(3);
+            if (ImGui::BeginMenuBar())
+            {
+                if (ImGui::BeginMenu("File"))
+                {
+                    if (!state.request_in_progress)
+                    {
+                        if (ImGui::MenuItem("New Request"))
+                        {
+                            state.url = "";
+                            state.request_body = "";
+                            {
+                                std::lock_guard<std::mutex> lock(state.response_mutex);
+                                state.response_text = "";
+                                state.response_headers = "";
+                                state.response_code = 0;
+                            }
+                            state.headers.clear();
+                            state.queries.clear();
+                        }
+                    }
+                    else
+                    {
+                        ImGui::MenuItem("New Request", nullptr, false, false);
+                    }
+                    if (ImGui::MenuItem("Open Request..."))
+                        show_open_popup = true;
+                    if (ImGui::MenuItem("Save Request..."))
+                        show_save_popup = true;
+                    ImGui::EndMenu();
+                }
+
+                if (ImGui::BeginMenu("View"))
+                {
+                    if (ImGui::BeginMenu("Panels"))
+                    {
+                        ImGui::MenuItem("Headers", nullptr, &state.show_headers);
+                        ImGui::MenuItem("Body", nullptr, &state.show_body);
+                        ImGui::MenuItem("Query", nullptr, &state.show_query);
+                        ImGui::EndMenu();
+                    }
+                    ImGui::Separator();
+                    ImGui::MenuItem("Show FPS", nullptr, &state.show_fps);
+                    ImGui::MenuItem("Style Editor", nullptr, &state.show_styleed);
+                    ImGui::EndMenu();
+                }
+
+                // fps counter
+                if (state.show_fps)
+                    ImGui::Text("fps: %.1f", ImGui::GetIO().Framerate);
+
+                ImGui::EndMenuBar();
+            }
+            ImGuiID dockspace_id = ImGui::GetID("dockspace");
+            ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f),
+                             ImGuiDockNodeFlags_None);
+            ImGui::End();
+        }
+
+        // if show_styleed is true, open the style editor
+        if (state.show_styleed)
+            ImGui::ShowStyleEditor();
+
+        // recent/saved requests window
+        {
+            ImGui::Begin("recent requests");
+            if (recent_requests.empty())
+            {
+                ImGui::Text("no recent requests");
+            }
+            else
+            {
+                std::unordered_map<std::string, int> name_count;
+                std::unordered_map<std::string, int> current_count;
+                // first pass: count names
+                for (const auto &req : recent_requests)
+                {
+                    name_count[req.name]++;
+                }
+                // second pass: display with numbers if needed
+                for (const auto &req : recent_requests)
+                {
+                    std::string display_name = req.name;
+                    if (name_count[req.name] > 1)
+                    {
+                        current_count[req.name]++;
+                        display_name += " " + std::to_string(current_count[req.name]);
+                    }
+                    if (ImGui::Selectable(display_name.c_str()))
+                    {
+                        parse_curl_request(state, req.curl_command);
+                    }
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::BeginTooltip();
+                        ImGui::TextUnformatted(req.curl_command.c_str());
+                        ImGui::EndTooltip();
+                    }
+                }
+            }
+            ImGui::End();
+        }
+
+        // request window
+        {
+            ImGui::Begin("request");
+            ImGui::SetNextItemWidth(80);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, get_method_color(state.selected_method));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, get_method_color(state.selected_method));
+            ImGui::PushStyleColor(ImGuiCol_Button, get_method_color(state.selected_method));
+            if (ImGui::BeginCombo("verb", state.methods[state.selected_method]))
+            {
+                for (int i = 0; i < IM_ARRAYSIZE(state.methods); i++)
+                {
+                    bool is_selected = (state.selected_method == i);
+                    if (ImGui::Selectable(state.methods[i], is_selected))
+                        state.selected_method = i;
+                    if (is_selected)
+                        ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##url", &state.url);
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.44f, 0.37f, 0.61f, 1.0f));        // Dracula purple
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.54f, 0.47f, 0.71f, 1.0f)); // Lighter purple
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.34f, 0.27f, 0.51f, 1.0f));  // Darker purple
+            if (ImGui::Button(state.request_in_progress ? "sending..." : "send",
+                              ImVec2(0, 0)) &&
+                !state.request_in_progress)
+            {
+                state.request_in_progress = true;
+                request_thread = std::make_unique<std::thread>(send_request, std::ref(state));
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::SameLine();
+            if (ImGui::BeginTabBar("request_tabs"))
+            {
+                if (ImGui::BeginTabItem("headers"))
+                {
+
+                    if (ImGui::Button("+ add header"))
+                        state.headers.push_back(RestClientState::KeyValue());
+
+                    for (size_t i = 0; i < state.headers.size(); i++)
+                    {
+                        ImGui::PushID(static_cast<int>(i));
+
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.1f, 0.1f, 1.0f));
+                        if (ImGui::Button("x"))
+                        {
+                            state.headers.erase(state.headers.begin() + i);
+                            ImGui::PopID();
+                            ImGui::PopStyleColor(3);
+                            continue;
+                        }
+                        ImGui::PopStyleColor(3);
+                        ImGui::SameLine();
+                        float avail_width = ImGui::GetContentRegionAvail().x;
+                        ImGui::SetNextItemWidth(avail_width * 0.45f);
+                        ImGui::InputText(":", &state.headers[i].key);
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(avail_width * 0.5f);
+                        ImGui::InputText("##value", &state.headers[i].value);
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("body"))
+                {
+                    ImGui::Spacing();
+
+                    ImGui::InputTextMultiline("##body", &state.request_body, ImVec2(-1.0f, 150));
+
+                    if (ImGui::Button("Prettify JSON"))
+                    {
+                        std::string formatted;
+                        if (try_format_json(state.request_body, formatted))
+                        {
+                            state.request_body = formatted;
+                        }
+                    }
+
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::SetTooltip("Format JSON request body");
+                    }
+
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("query"))
+                {
+
+                    if (ImGui::Button("+ add query param"))
+                        state.queries.push_back(RestClientState::KeyValue());
+
+                    for (size_t i = 0; i < state.queries.size(); i++)
+                    {
+                        ImGui::PushID(static_cast<int>(i));
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.1f, 0.1f, 1.0f));
+                        if (ImGui::Button("x"))
+                        {
+                            state.queries.erase(state.queries.begin() + i);
+                            ImGui::PopID();
+                            ImGui::PopStyleColor(3);
+                            continue;
+                        }
+                        ImGui::PopStyleColor(3);
+                        ImGui::SameLine();
+                        float avail_width = ImGui::GetContentRegionAvail().x;
+                        ImGui::SetNextItemWidth(avail_width * 0.45f);
+                        ImGui::InputText("=", &state.queries[i].key);
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(avail_width * 0.5f);
+                        ImGui::InputText("##value", &state.queries[i].value);
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+            ImGui::End();
+        }
+
+        {
+            ImGui::Begin("response body");
+            {
+                std::lock_guard<std::mutex> lock(state.response_mutex);
+                ImGui::Text("status:");
+                ImGui::SameLine();
+                ImVec4 status_color;
+                if (state.response_code >= 200 && state.response_code < 300)
+                    status_color = ImVec4(0.27f, 1.00f, 0.38f, 1.0f); // Green for 2xx
+                else if (state.response_code >= 300 && state.response_code < 400)
+                    status_color = ImVec4(0.24f, 0.48f, 1.0f, 1.0f); // Blue for 3xx
+                else if (state.response_code >= 400 && state.response_code < 500)
+                    status_color = ImVec4(0.98f, 0.67f, 0.13f, 1.0f); // Orange for 4xx
+                else if (state.response_code >= 500)
+                    status_color = ImVec4(0.98f, 0.30f, 0.24f, 1.0f); // Red for 5xx
+                else
+                    status_color = ImVec4(0.5f, 0.5f, 0.5f, 1.0f); // Gray for others
+                ImGui::TextColored(status_color, "%ld", state.response_code);
+                ImGui::SameLine();
+                if (state.request_in_progress)
+                {
+                    auto now = std::chrono::steady_clock::now();
+                    double current_ms = std::chrono::duration<double, std::milli>(
+                                            now - state.request_start_time)
+                                            .count();
+                    if (current_ms > 1000)
+                        ImGui::Text("%.1fs", current_ms / 1000.0);
+                    else
+                        ImGui::Text("%.0f ms", current_ms);
+                }
+                else if (state.elapsed_ms > 0)
+                {
+                    double elapsed = state.elapsed_ms.load();
+                    if (elapsed > 1000)
+                        ImGui::Text("%.1fs", elapsed / 1000.0);
+                    else
+                        ImGui::Text("%.0f ms", elapsed);
+                }
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20);
+                size_t char_count = state.response_text.length();
+                size_t byte_size = state.response_text.size();
+                ImGui::Text("%zu chars, %s", char_count, format_size(byte_size).c_str());
+
+                if (!state.response_headers.empty())
+                {
+                    std::istringstream iss(state.response_headers);
+                    std::vector<std::pair<std::string, std::string>> parsedHeaders;
+                    std::string line;
+                    auto trim = [](std::string &s)
+                    {
+                        s.erase(s.begin(),
+                                std::find_if(s.begin(), s.end(),
+                                             [](unsigned char ch)
+                                             {
+                                                 return !std::isspace(ch);
+                                             }));
+                        s.erase(std::find_if(s.rbegin(), s.rend(),
+                                             [](unsigned char ch)
+                                             {
+                                                 return !std::isspace(ch);
+                                             })
+                                    .base(),
+                                s.end());
+                    };
+                    // Skip first line (HTTP status line)
+                    std::getline(iss, line);
+                    while (std::getline(iss, line))
+                    {
+                        if (!line.empty() && line.back() == '\r')
+                            line.pop_back();
+                        if (line.empty())
+                            continue;
+                        size_t pos = line.find(':');
+                        if (pos != std::string::npos)
+                        {
+                            std::string key = line.substr(0, pos);
+                            std::string value = line.substr(pos + 1);
+                            trim(key);
+                            trim(value);
+                            parsedHeaders.push_back({key, value});
+                        }
+                        else
+                        {
+                            parsedHeaders.push_back({line, ""});
+                        }
+                    }
+
+                    bool is_json = false;
+                    for (const auto &header : parsedHeaders)
+                    {
+                        std::string header_name = header.first;
+                        std::transform(header_name.begin(), header_name.end(), header_name.begin(), ::tolower);
+                        if (header_name == "content-type" &&
+                            header.second.find("application/json") == 0)
+                        {
+                            is_json = true;
+                            break;
+                        }
+                    }
+
+                    if (is_json)
+                    {
+                        if (ImGui::IsKeyPressed(ImGuiKey_P, false) &&
+                            (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper))
+                        {
+                            state.pretty_print_json = !state.pretty_print_json;
+                            if (state.pretty_print_json)
+                            {
+                                try_format_json(state.response_text, state.formatted_response);
+                            }
+                        }
+
+                        ImGui::SameLine();
+                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(1, 0));
+                        if (ImGui::Checkbox("pretty print", &state.pretty_print_json))
+                        {
+                            if (state.pretty_print_json)
+                            {
+                                try_format_json(state.response_text, state.formatted_response);
+                            }
+                        }
+                        if (ImGui::IsItemHovered())
+                        {
+                            ImGui::SetTooltip("Can be toggled with Ctrl+P");
+                        }
+                        ImGui::PopStyleVar();
+                    }
+                }
+
+                ImGui::Spacing();
+                ImGui::InputTextMultiline(
+                    "##response",
+                    state.pretty_print_json ? &state.formatted_response : &state.response_text,
+                    ImVec2(-1.0f, -1.0f),
+                    ImGuiInputTextFlags_ReadOnly);
+            }
+            ImGui::End();
+        }
+
+        // response headers window
+        {
+            ImGui::Begin("response headers");
+            {
+                std::lock_guard<std::mutex> lock(state.response_mutex);
+                if (!state.response_headers.empty())
+                {
+                    std::istringstream iss(state.response_headers);
+                    std::vector<std::pair<std::string, std::string>> parsedHeaders;
+                    std::string line;
+                    auto trim = [](std::string &s)
+                    {
+                        s.erase(s.begin(),
+                                std::find_if(s.begin(), s.end(),
+                                             [](unsigned char ch)
+                                             {
+                                                 return !std::isspace(ch);
+                                             }));
+                        s.erase(std::find_if(s.rbegin(), s.rend(),
+                                             [](unsigned char ch)
+                                             {
+                                                 return !std::isspace(ch);
+                                             })
+                                    .base(),
+                                s.end());
+                    };
+                    // Skip first line (HTTP/1.1 statement)
+                    std::getline(iss, line);
+                    while (std::getline(iss, line))
+                    {
+                        if (!line.empty() && line.back() == '\r')
+                            line.pop_back();
+                        if (line.empty())
+                            continue;
+                        size_t pos = line.find(':');
+                        if (pos != std::string::npos)
+                        {
+                            std::string key = line.substr(0, pos);
+                            std::string value = line.substr(pos + 1);
+                            trim(key);
+                            trim(value);
+                            parsedHeaders.push_back({key, value});
+                        }
+                        else
+                        {
+                            parsedHeaders.push_back({line, ""});
+                        }
+                    }
+                    if (ImGui::BeginTable("response_headers_table", 2,
+                                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+                    {
+                        ImGui::TableSetupColumn("Header", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+                        for (const auto &header : parsedHeaders)
+                        {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::PushID(("header" + header.first).c_str());
+                            ImGui::TextUnformatted(header.first.c_str());
+                            if (ImGui::BeginPopupContextItem("header_context"))
+                            {
+                                if (ImGui::MenuItem("Copy Header"))
+                                    ImGui::SetClipboardText(header.first.c_str());
+                                ImGui::EndPopup();
+                            }
+                            ImGui::PopID();
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::PushID(("value" + header.first).c_str());
+                            ImGui::TextWrapped("%s", header.second.c_str());
+                            if (ImGui::BeginPopupContextItem("value_context"))
+                            {
+                                if (ImGui::MenuItem("Copy Value"))
+                                    ImGui::SetClipboardText(header.second.c_str());
+                                ImGui::EndPopup();
+                            }
+                            ImGui::PopID();
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+                else
+                {
+                    ImGui::Text("no response headers");
+                }
+            }
+            ImGui::End();
+        }
+
+        if (!show_save_popup && !show_open_popup &&
+            ImGui::IsKeyPressed(ImGuiKey_S, false) &&
+            (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper))
+        {
+            show_save_popup = true;
+        }
+
+        if (!show_save_popup && !show_open_popup &&
+            ImGui::IsKeyPressed(ImGuiKey_O, false) &&
+            (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper))
+        {
+            show_open_popup = true;
+        }
+
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+        {
+            show_save_popup = false;
+            show_open_popup = false;
+        }
+
+        // save popup
+        if (show_save_popup)
+        {
+            ImGui::OpenPopup("save request");
+            show_save_popup = false;
+        }
+        if (ImGui::BeginPopupModal("save request", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::InputText("file", &save_file_path);
+            if (ImGui::Button("save", ImVec2(120, 0)))
+            {
+                std::ofstream ofs(save_file_path);
+                if (ofs)
+                {
+                    std::string curl_cmd = request_to_curl(state);
+                    ofs << curl_cmd;
+                    ofs.close();
+                    recent_requests = load_saved_requests();
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("cancel", ImVec2(120, 0)))
+            {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        // open popup
+        if (show_open_popup)
+        {
+            ImGui::OpenPopup("open request");
+            show_open_popup = false;
+        }
+        if (ImGui::BeginPopupModal("open request", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::InputText("file", &open_file_path);
+            if (ImGui::Button("open", ImVec2(120, 0)))
+            {
+                std::ifstream ifs(open_file_path);
+                if (ifs)
+                {
+                    std::stringstream buffer;
+                    buffer << ifs.rdbuf();
+                    std::string curl_cmd = buffer.str();
+                    parse_curl_request(state, curl_cmd);
+                    recent_requests = load_saved_requests();
+                }
+                ifs.close();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("cancel", ImVec2(120, 0)))
+            {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        ImGui::Render();
+        glViewport(0, 0, static_cast<int>(io.DisplaySize.x),
+                   static_cast<int>(io.DisplaySize.y));
+        glClearColor(clear_color.x * clear_color.w,
+                     clear_color.y * clear_color.w,
+                     clear_color.z * clear_color.w,
+                     clear_color.w);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        SDL_GL_SwapWindow(window);
+
+#ifdef __EMSCRIPTEN__
+        EMSCRIPTEN_MAINLOOP_END;
+#endif
+    }
+
+    if (request_thread && request_thread->joinable())
+        request_thread->join();
+
+    curl_global_cleanup();
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDL2_Shutdown();
+    ImGui::DestroyContext();
+    SDL_GL_DeleteContext(gl_context);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+
+    return 0;
+}
